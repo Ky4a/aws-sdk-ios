@@ -15,22 +15,19 @@
 
 #import "AWSCognitoAuth_Internal.h"
 #import <AWSCognitoIdentityProviderASF/AWSCognitoIdentityProviderASF.h>
-#import <SafariServices/SafariServices.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <CommonCrypto/CommonHMAC.h>
 #import <AWSCore/AWSCore.h>
 
 NSString *const AWSCognitoAuthErrorDomain = @"com.amazon.cognito.AWSCognitoAuthErrorDomain";
 
-@interface AWSCognitoAuth()<SFSafariViewControllerDelegate, NSURLConnectionDelegate>
+@interface AWSCognitoAuth()<NSURLConnectionDelegate, WKNavigationDelegate>
 
 @property (atomic, readwrite) AWSCognitoAuthGetSessionBlock getSessionBlock;
 @property (atomic, readwrite) AWSCognitoAuthSignOutBlock signOutBlock;
 @property (atomic, readwrite) NSError * getSessionError;
 @property (atomic, readwrite) NSError * signOutError;
 
-@property (atomic, readwrite) SFSafariViewController *svc;
-@property (atomic, readwrite) UIViewController * pvc;
 @property (atomic, readwrite) NSString * state;
 @property (atomic, readwrite) NSString * proofKey;
 @property (atomic, readwrite) NSString * proofKeyHash;
@@ -39,27 +36,12 @@ NSString *const AWSCognitoAuthErrorDomain = @"com.amazon.cognito.AWSCognitoAuthE
 @property (nonatomic, strong) NSOperationQueue * getSessionQueue;
 @property (nonatomic, strong) NSOperationQueue * signOutQueue;
 
-@property (nonatomic) BOOL useSFAuthenticationSession;
-@property (nonatomic) BOOL sfAuthenticationSessionAvailable;
 @property (nonatomic) BOOL isHandlingRedirection;
 @property (nonatomic) BOOL isAuthProviderExternal;
 @property (nonatomic) BOOL isProcessingSignOut;
 @property (nonatomic) BOOL isProcessingSignIn;
 
-@end
-
-API_AVAILABLE(ios(11.0))
-@interface AWSCognitoAuth()
-
-@property (nonatomic, strong) SFAuthenticationSession *sfAuthSession;
-
-@end
-
-API_AVAILABLE(ios(13.0))
-@interface AWSCognitoAuth()<ASWebAuthenticationPresentationContextProviding>
-
-@property (nonatomic, strong) ASWebAuthenticationSession *asAuthSession;
-@property (nonatomic, weak) ASPresentationAnchor presentationAnchor;
+@property (nonatomic) WKWebView *headlessWebView;
 
 
 @end
@@ -73,15 +55,12 @@ API_AVAILABLE(ios(13.0))
 @property (nonatomic, readwrite) NSDictionary<NSString *, NSString *> * tokensUriQueryParameters;
 @property (nonatomic, readwrite) NSDictionary<NSString *, NSString *> * signOutUriQueryParameters;
 @property (nonatomic) BOOL isAuthProviderExternal;
-@property (nonatomic) BOOL isSignInPrivateSession;
 @property (nonatomic) AWSServiceConfiguration * userPoolConfig;
-
 @end
 
 @implementation AWSCognitoAuth
 
 NSString *const AWSCognitoAuthSDKVersion = @"2.27.6";
-
 
 static NSMutableDictionary *_instanceDictionary = nil;
 static dispatch_queue_t _dispatchQueue = nil;
@@ -146,8 +125,7 @@ static NSString * AWSCognitoAuthAsfDeviceId = @"asf.device.id";
                                                                                                             webDomain:webDomain
                                                                                                      identityProvider:identityProvider
                                                                                                         idpIdentifier:idpIdentifier
-                                                                                             userPoolIdForEnablingASF:userPoolId
-                                                                                       enableSFAuthSessionIfAvailable:useSFAuthSession];
+                                                                                             userPoolIdForEnablingASF:userPoolId];
             _defaultAuth = [[AWSCognitoAuth alloc] initWithConfiguration:authConfiguration];
         } else {
             @throw [NSException exceptionWithName:NSInternalInconsistencyException
@@ -197,8 +175,6 @@ static NSString * AWSCognitoAuthAsfDeviceId = @"asf.device.id";
 
         _authConfiguration = [authConfiguration copy];
 
-        _useSFAuthenticationSession = authConfiguration.isSFAuthenticationSessionEnabled;
-        _sfAuthenticationSessionAvailable = NO;
         _keychain = [AWSCognitoAuthUICKeyChainStore keyChainStoreWithService:[NSString stringWithFormat:@"%@.%@", [NSBundle mainBundle].bundleIdentifier, @"AWSCognitoIdentityUserPool"]];  //Consistent with AWSCognitoIdentityUserPool
     }
     return self;
@@ -216,59 +192,27 @@ static NSString * AWSCognitoAuthAsfDeviceId = @"asf.device.id";
     return refreshToken!=nil;
 }
 
-- (void)launchSignInWithViewController:(UIViewController *) vc
-                            completion:(nullable AWSCognitoAuthGetSessionBlock) completion {
-    [self launchUsing:nil uiViewController:vc completion:completion];
-}
-
-- (void)launchSignInWithWebUI:(nonnull ASPresentationAnchor) anchor
-                   completion:(nullable AWSCognitoAuthGetSessionBlock) completion {
-    [self launchUsing:anchor uiViewController:nil completion:completion];
-}
-
-- (void)launchUsing:(nullable ASPresentationAnchor) anchor
-   uiViewController:(nullable UIViewController *) vc
-         completion:(nullable AWSCognitoAuthGetSessionBlock) completion {
-    __block __weak NSOperation *weakGetSessionOperation;
-    NSOperation *getSessionOperation = [NSBlockOperation blockOperationWithBlock:^{
-        self.presentationAnchor = anchor;
-        [self prepareForSignIn:vc completion:completion];
-        if(weakGetSessionOperation.isCancelled){
-            [self dismissSafariViewControllerAndCompleteGetSession:nil error:self.getSessionError];
-        }
-        [self launchSignInVC:vc];
-    }];
-    weakGetSessionOperation = getSessionOperation;
-    [self.getSessionQueue addOperation:getSessionOperation];
-}
-
-#pragma mark get session
+#pragma mark sign in
 
 - (void)getSession:(AWSCognitoAuthGetSessionBlock) completion {
-    self.presentationAnchor = nil;
-    [self enqueueGetSession:nil completion:completion];
+    [self enqueueGetSessionWithCompletion:completion];
 }
 
-- (void)getSession:(UIViewController *) vc completion: (AWSCognitoAuthGetSessionBlock) completion {
-    self.presentationAnchor = nil;
-    [self enqueueGetSession:vc completion:completion];
-}
-
-- (void)getSessionWithWebUI: (ASPresentationAnchor) anchor
-                 completion: (nullable AWSCognitoAuthGetSessionBlock) completion {
-    self.presentationAnchor = anchor;
-    [self enqueueGetSession:nil completion:completion];
+- (void)cancelGetSession:(NSError *)error {
+    [self setInternalGetSessionErrorAndCancelSignInOperations:error];
+    self.isProcessingSignIn = NO;
+    [self cleanUpAndCallGetSessionBlock:nil error:error];
 }
 
 /**
  Adds another getSession operation to the serialized queue of getSession requests
  */
-- (void)enqueueGetSession:(nullable UIViewController *) vc completion: (AWSCognitoAuthGetSessionBlock) completion {
+- (void)enqueueGetSessionWithCompletion: (AWSCognitoAuthGetSessionBlock) completion {
     __block __weak NSOperation *weakGetSessionOperation;
     NSOperation *getSessionOperation =  [NSBlockOperation blockOperationWithBlock:^{
-        [self getSessionInternal:vc completion:completion];
+        [self getSessionInternalWithCompletion:completion];
         if(weakGetSessionOperation.isCancelled){
-            [self dismissSafariViewControllerAndCompleteGetSession:nil error:self.getSessionError];
+            [self completeGetSession:nil error:self.getSessionError];
         }
     }];
     weakGetSessionOperation = getSessionOperation;
@@ -283,23 +227,14 @@ static NSString * AWSCognitoAuthAsfDeviceId = @"asf.device.id";
     self.proofKey = nil;
     self.state = nil;
     self.proofKeyHash = nil;
-    self.pvc = nil;
+    self.headlessWebView = nil;
     self.responseData = nil;
 }
 
-- (void)prepareForSignIn:(UIViewController *) vc
-              completion:(AWSCognitoAuthGetSessionBlock) completion {
-    self.getSessionBlock = completion;
-    self.state = [[[NSUUID UUID] UUIDString] lowercaseString];
-    self.proofKey = [self generateRandom:32];
-    self.proofKeyHash = [self calculateSHA256Hash:self.proofKey];
-    self.pvc = vc;
-}
-
 /**
- Launch the sign in ui on the provided viewcontroller
+ Launch the sign in
  */
-- (void) launchSignInVC: (UIViewController *) vc {
+- (void) launchSignIn {
     NSString *suffix = @"";
     if(self.authConfiguration.idpIdentifier || self.authConfiguration.identityProvider){
         if(self.authConfiguration.idpIdentifier){
@@ -309,135 +244,84 @@ static NSString * AWSCognitoAuthAsfDeviceId = @"asf.device.id";
         }
     }
     if(self.authConfiguration.asfEnabled){
-        NSString *userContextEncoded = [AWSCognitoIdentityProviderASF userContextData:self.authConfiguration.userPoolId
-                                                                             username:@"unknown"
-                                                                             deviceId:[self asfDeviceId]
-                                                                     userPoolClientId:self.authConfiguration.appClientId];
+        NSString *userContextEncoded = [AWSCognitoIdentityProviderASF userContextData:self.authConfiguration.userPoolId username:@"unknown" deviceId:[self asfDeviceId] userPoolClientId:self.authConfiguration.appClientId];
         NSString * userContext = [NSString stringWithFormat:@"&userContextData=%@",[self urlEncode:userContextEncoded]];
         suffix = [suffix stringByAppendingString:userContext];
     }
 
-    NSString *urlString = [NSString stringWithFormat:@"%@?response_type=code&client_id=%@&state=%@&redirect_uri=%@&scope=%@&code_challenge=%@&code_challenge_method=S256%@&%@",
-                     self.authConfiguration.signInUri,
-                     self.authConfiguration.appClientId,
-                     self.state,
-                     [self urlEncode:self.authConfiguration.signInRedirectUri],
-                     [self urlEncode:[self normalizeScopes]],
-                     self.proofKeyHash,
-                     suffix,
-                     [self getQueryStringSuffixForParameters: self.authConfiguration.signInUriQueryParameters]];
+    NSString *url = [NSString stringWithFormat:@"%@?response_type=code&client_id=%@&state=%@&redirect_uri=%@&scope=%@&code_challenge=%@&code_challenge_method=S256%@&%@",self.authConfiguration.signInUri, self.authConfiguration.appClientId, self.state,[self urlEncode:self.authConfiguration.signInRedirectUri], [self urlEncode:[self normalizeScopes]], self.proofKeyHash, suffix, [self getQueryStringSuffixForParameters: self.authConfiguration.signInUriQueryParameters]];
 
-    NSURL *url = [NSURL URLWithString:urlString];
-    if(@available(iOS 13.0, *)) {
-        if (self.presentationAnchor) {
-            [self launchASWebAuthenticationSession: url];
-        } else {
-            [self launchLegacySession:url withPresentingViewController:vc];
-        }
-    } else {
-        [self launchLegacySession:url withPresentingViewController:vc];
+    [self startHeadlessSignInForURL:url];
+}
+
+- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation
+{
+    if (self.isProcessingSignIn) {
+        [webView evaluateJavaScript:@"(document.getElementById('error-page') == null)" completionHandler:^(id errorPage, NSError *error) {
+            if (error) {
+                [self cancelGetSession:error];
+            } else if ([errorPage boolValue] == NO) {
+                [webView evaluateJavaScript:@"({error: {status: document.getElementById('error-status-code').textContent, message: document.getElementById('error-message').textContent, description: document.getElementById('error-description').textContent, cause: document.getElementById('error-cause').textContent }})" completionHandler:^(id errorObject, NSError *error) {
+                    if (error) {
+                        [self cancelGetSession:error];
+                    } else if (errorObject) {
+                        [self cancelGetSession:[NSError errorWithDomain:AWSCognitoAuthErrorDomain code:AWSCognitoAuthClientErrorInternalError userInfo:@{
+                                NSLocalizedFailureReasonErrorKey: [NSString stringWithFormat:@"%@ - %@", errorObject[@"error"][@"status"], errorObject[@"error"][@"message"]],
+                                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"%@\n%@", errorObject[@"error"][@"description"], errorObject[@"error"][@"cause"]]
+                        }]];
+                    }
+                }];
+            } else {
+                [webView evaluateJavaScript:@"(document.getElementById('invalid-credentials') == null)" completionHandler:^(id result, NSError *error) {
+                    if (error) {
+                        [self cancelGetSession:error];
+                    } else if ([result boolValue] == NO) {
+                        [self completeGetSession:nil error:[self getError:@"Invalid Credentials" code:AWSCognitoAuthClientErrorInvalidCredentials]];
+                    } else if (self.delegate) {
+                        [self.delegate headlessWebView:self.headlessWebView didFinishNavigationWithURL:self.headlessWebView.URL];
+                    }
+                }];
+            }
+        }];
+    } else if (self.isProcessingSignOut) {
+        [self completeSignOut:nil];
     }
 }
 
-- (void)launchLegacySession:(NSURL *)url
-withPresentingViewController:(UIViewController *)presentingViewController {
-    if (self.useSFAuthenticationSession) {
-        if (@available(iOS 11.0, *)) {
-            [self launchSFWebAuthenticationSession: url];
-        } else {
-            // Fallback on earlier versions
-            [self showSFSafariViewControllerForURL:url withPresentingViewController:presentingViewController];
-        }
-    } else {
-        [self showSFSafariViewControllerForURL:url withPresentingViewController:presentingViewController];
+
+- (void)webView:(WKWebView *)webView didFailProvisionalNavigation:(WKNavigation *)navigation withError:(NSError *)navError
+{
+    NSURL *callbackURL = navError.userInfo[NSURLErrorFailingURLErrorKey];
+    if (callbackURL) {
+        [self processURL:callbackURL forRedirection:YES];
     }
 }
 
-- (void)launchSFWebAuthenticationSession:(NSURL *)hostedUIURL API_AVAILABLE(ios(11.0)) {
-    self.sfAuthenticationSessionAvailable = YES;
-    NSString *callbackURLScheme = [[self urlEncode:self.authConfiguration.signInRedirectUri] copy];
-    __weak AWSCognitoAuth *weakSelf = self;
-    self.sfAuthSession = [[SFAuthenticationSession alloc] initWithURL:hostedUIURL
-                                                    callbackURLScheme:callbackURLScheme
-                                                    completionHandler:^(NSURL * _Nullable url,
-                                                                        NSError * _Nullable error) {
-        __strong AWSCognitoAuth *strongSelf = weakSelf;
-        [strongSelf handleSignInCallbackWithURL:url error:error];
-    }];
-    [self.sfAuthSession start];
+- (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
+    decisionHandler(WKNavigationActionPolicyAllow);
 }
 
-- (void)launchASWebAuthenticationSession:(NSURL *)hostedUIURL API_AVAILABLE(ios(13.0)) {
-    NSString *callbackURLString = [[self urlEncode:self.authConfiguration.signInRedirectUri] copy];
-    NSURL *callbackURL = [[NSURL alloc] initWithString:callbackURLString];
-    NSString *callbackURLScheme = callbackURL.scheme;
-    __weak AWSCognitoAuth *weakSelf = self;
-    self.asAuthSession = [[ASWebAuthenticationSession alloc] initWithURL:hostedUIURL
-                                                       callbackURLScheme:callbackURLScheme
-                                                       completionHandler:^(NSURL * _Nullable url,
-                                                                           NSError * _Nullable error) {
-        __strong AWSCognitoAuth *strongSelf = weakSelf;
-        [strongSelf handleSignInCallbackWithURL:url error:error];
-    }];
-    
-    if (@available(iOS 13.0, *)) {
-        self.asAuthSession.prefersEphemeralWebBrowserSession = self.authConfiguration.isSignInPrivateSession;
-        self.asAuthSession.presentationContextProvider = self;
-    }
-    [self.asAuthSession start];
-}
-
-- (nonnull ASPresentationAnchor)presentationAnchorForWebAuthenticationSession:(nonnull ASWebAuthenticationSession *)session  API_AVAILABLE(ios(13.0)) {
-    return self.presentationAnchor;
-}
-
-- (void)handleSignInCallbackWithURL:(NSURL * _Nullable) url
-                              error:(NSError * _Nullable) error {
-    if (url) {
-        [self processURL:url forRedirection:NO];
-    } else {
-        [self dismissSafariViewControllerAndCompleteGetSession:nil error:error];
-    }
-}
-
--(void)showSFSafariViewControllerForURL:(NSURL *)url
-           withPresentingViewController:(UIViewController *)presentingViewController{
-    self.svc = [[SFSafariViewController alloc] initWithURL:url entersReaderIfAvailable:NO];
-    self.svc.delegate = self;
-    self.svc.modalPresentationStyle = UIModalPresentationPopover;
+-(void)startHeadlessSignInForURL:(NSString *)url {
     self.isProcessingSignIn = YES;
     dispatch_async(dispatch_get_main_queue(), ^{
-        __block UIViewController * sourceVC = presentingViewController;
-        if(!sourceVC){
-            if(!self.delegate){
-                [self dismissSafariViewControllerAndCompleteGetSession:nil error:[self getError:@"delegate must be set to a valid AWSCognitoAuthDelegate" code:AWSCognitoAuthClientInvalidAuthenticationDelegate]];
-                return;
-            } else {
-                sourceVC = [self.delegate getViewController];
-            }
-        }
-        [self setPopoverSource:self.svc source:sourceVC];
-        [sourceVC presentViewController:self.svc animated:NO completion:nil];
+        WKWebViewConfiguration *wkConfiguration = [WKWebViewConfiguration new];
+        self.headlessWebView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:wkConfiguration];
+        self.headlessWebView.navigationDelegate = self;
+        NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:url]];
+        [self.headlessWebView loadRequest:request];
     });
-}
-
-/**
- * Configure source view for a modal popup view controller
- */
--(UIViewController *) setPopoverSource: (UIViewController *) popover source: (UIViewController *) source {
-    popover.popoverPresentationController.sourceView = source.view;
-    popover.popoverPresentationController.sourceRect = source.view.bounds;
-    [popover setPreferredContentSize:CGSizeMake(source.view.bounds.size.width/1.5,source.view.bounds.size.height/1.5)];
-    [popover.popoverPresentationController setPermittedArrowDirections:0];
-    return popover;
 }
 
 /**
  Check keychain for valid session, if expired or not available, prompt end user via ui
  */
-- (void)getSessionInternal: (nullable UIViewController *) vc completion: (AWSCognitoAuthGetSessionBlock) completion {
+- (void)getSessionInternalWithCompletion: (AWSCognitoAuthGetSessionBlock) completion {
+    self.getSessionBlock = completion;
+    self.state = [[[NSUUID UUID] UUIDString] lowercaseString];
+    self.proofKey = [self generateRandom:32];
+    self.proofKeyHash = [self calculateSHA256Hash:self.proofKey];
 
-    [self prepareForSignIn:vc completion:completion];
+
     //check to see if we have valid tokens
     NSString * username = [self currentUsername];
     if(username){
@@ -460,7 +344,7 @@ withPresentingViewController:(UIViewController *)presentingViewController {
                                                                                              accessToken:accessToken
                                                                                             refreshToken:refreshToken
                                                                                           expirationTime:expiration];
-                [self dismissSafariViewControllerAndCompleteGetSession:session error:nil];
+                [self completeGetSession:session error:nil];
                 return;
             }
             //else refresh it using the refresh token
@@ -484,25 +368,20 @@ withPresentingViewController:(UIViewController *)presentingViewController {
         }
     }
     //if we made it this far, we need the end user to authenticate
-    [self launchSignInVC: vc];
+    [self launchSignIn];
 }
 
 /**
  Dismiss ui, invoke completion and cleanup a getSession call.
  */
-- (void) dismissSafariViewControllerAndCompleteGetSession: (nullable AWSCognitoAuthUserSession *) userSession  error:(nullable NSError *) error {
-    if(error){
-        [self setInternalGetSessionErrorAndCancelSignInOperations:error];
-    }
-    self.isProcessingSignIn = NO;
-
-    if (self.sfAuthenticationSessionAvailable) {
+- (void) completeGetSession: (nullable AWSCognitoAuthUserSession *) userSession  error:(nullable NSError *) error {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        if(error){
+            [self setInternalGetSessionErrorAndCancelSignInOperations:error];
+        }
+        self.isProcessingSignIn = NO;
         [self cleanUpAndCallGetSessionBlock:userSession error:error];
-    } else {
-        [self dismissSafariVC: ^{
-            [self cleanUpAndCallGetSessionBlock:userSession error:error];
-        }];
-    }
+    });
 }
 
 - (void) cleanUpAndCallGetSessionBlock: (nullable AWSCognitoAuthUserSession *) userSession  error:(nullable NSError *) error {
@@ -518,19 +397,14 @@ withPresentingViewController:(UIViewController *)presentingViewController {
 /**
  Dismiss ui, invoke completion and cleanup a signOut call.
  */
-- (void) dismissSafariViewControllerAndCompleteSignOut:(nullable NSError *) error {
-    if(error){
-        [self setInternalSignOutErrorAndCancelSignOutOperations:error];
-    }
-    self.isProcessingSignOut = NO;
-
-    if (self.sfAuthenticationSessionAvailable) {
+- (void) completeSignOut:(nullable NSError *) error {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        if(error){
+            [self setInternalSignOutErrorAndCancelSignOutOperations:error];
+        }
+        self.isProcessingSignOut = NO;
         [self cleanUpAndCallSignOutBlock:error];
-    } else {
-        [self dismissSafariVC: ^{
-            [self cleanUpAndCallSignOutBlock:error];
-        }];
-    }
+    });
 }
 
 - (void) cleanUpAndCallSignOutBlock:(nullable NSError *) error {
@@ -542,35 +416,27 @@ withPresentingViewController:(UIViewController *)presentingViewController {
 }
 
 - (void) signOut: (AWSCognitoAuthSignOutBlock) completion {
-    self.presentationAnchor = nil;
     if(!self.delegate){
         completion([self getError:@"delegate must be set to a valid AWSCognitoAuthDelegate" code:AWSCognitoAuthClientInvalidAuthenticationDelegate]);
     }else {
-        [self signOut: [self.delegate getViewController] completion:completion];
+        [self signOutWithCompletion:completion];
     }
 }
 
-- (void) signOut: (UIViewController *) vc completion: (AWSCognitoAuthSignOutBlock) completion {
-    self.presentationAnchor = nil;
-    [self enqueueSignOut:vc completion:completion];
-}
-
-- (void) signOutWithWebUI:(ASPresentationAnchor) anchor completion:(AWSCognitoAuthSignOutBlock) completion {
-    self.presentationAnchor = anchor;
-    [self enqueueSignOut:nil completion:completion];
-}
-
-- (void)enqueueSignOut:(nullable UIViewController *) vc
-            completion: (AWSCognitoAuthSignOutBlock) completion {
-    __block __weak NSOperation *weakSignOutOperation;
-    NSOperation *signOutOperation =  [NSBlockOperation blockOperationWithBlock:^{
-        if(weakSignOutOperation.isCancelled){
-            completion(self.signOutError);
-        }
-        [self signOutInternal:vc completion:completion];
+- (void) signOutWithCompletion: (AWSCognitoAuthSignOutBlock) completion {
+    NSSet *websiteDataTypes = [NSSet setWithArray:@[WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeOfflineWebApplicationCache, WKWebsiteDataTypeMemoryCache, WKWebsiteDataTypeLocalStorage, WKWebsiteDataTypeCookies, WKWebsiteDataTypeSessionStorage]];
+    NSDate *dateFrom = [NSDate dateWithTimeIntervalSince1970:0];
+    [[WKWebsiteDataStore defaultDataStore] removeDataOfTypes:websiteDataTypes modifiedSince:dateFrom completionHandler:^{
+        __block __weak NSOperation *weakSignOutOperation;
+        NSOperation *signOutOperation =  [NSBlockOperation blockOperationWithBlock:^{
+            if(weakSignOutOperation.isCancelled){
+                completion(self.signOutError);
+            }
+            [self signOutInternalWithCompletion:completion];
+        }];
+        weakSignOutOperation = signOutOperation;
+        [self.signOutQueue addOperation:signOutOperation];
     }];
-    weakSignOutOperation = signOutOperation;
-    [self.signOutQueue addOperation:signOutOperation];
 }
 
 - (NSString *)getQueryStringSuffixForParameters:(NSDictionary<NSString *, NSString *> *)queryParameters {
@@ -594,91 +460,23 @@ withPresentingViewController:(UIViewController *)presentingViewController {
 /**
  Display ui for signout
  */
-- (void) signOutInternal:(UIViewController *) vc completion:(AWSCognitoAuthSignOutBlock) completion {
+- (void) signOutInternalWithCompletion: (AWSCognitoAuthSignOutBlock) completion {
     self.signOutBlock = completion;
-    NSString *urlString = [NSString stringWithFormat:@"%@?%@",
+    NSString *url = [NSString stringWithFormat:@"%@?%@",
                      self.authConfiguration.signOutUri,
                      [self getQueryStringSuffixForParameters:self.authConfiguration.signOutUriQueryParameters]];
-    NSURL *url = [NSURL URLWithString:urlString];
-    if(@available(iOS 13.0, *)) {
-        if (self.presentationAnchor) {
-            [self launchASWebAuthenticationSessionForSignOut:url];
-        } else {
-            [self launchLegacySessionForSignOut:url withPresentingViewController:vc];
-        }
-    } else {
-        [self launchLegacySessionForSignOut:url withPresentingViewController:vc];
-    }
+
+    [self signOutWithUrl:url];
 }
 
-- (void)launchASWebAuthenticationSessionForSignOut:(NSURL *) url API_AVAILABLE(ios(13.0)) {
-    NSString *callbackURLString = [[self urlEncode:self.authConfiguration.signInRedirectUri] copy];
-    NSURL *callbackURL = [[NSURL alloc] initWithString:callbackURLString];
-    NSString *callbackURLScheme = callbackURL.scheme;
-    __weak AWSCognitoAuth *weakSelf = self;
-    self.asAuthSession = [[ASWebAuthenticationSession alloc] initWithURL:url
-                                                       callbackURLScheme:callbackURLScheme
-                                                       completionHandler:^(NSURL * _Nullable url,
-                                                                           NSError * _Nullable error) {
-        __strong AWSCognitoAuth *strongSelf = weakSelf;
-        if (url) {
-            [strongSelf processURL:url forRedirection:NO];
-        } else {
-            if (error.code != ASWebAuthenticationSessionErrorCodeCanceledLogin) {
-                [strongSelf signOutLocallyAndClearLastKnownUser];
-            }
-            [strongSelf dismissSafariViewControllerAndCompleteSignOut:error];
-        }
-    }];
-    if (@available(iOS 13.0, *)) {
-        self.asAuthSession.presentationContextProvider = self;
-    }
-    [self.asAuthSession start];
-}
-
-- (void)launchLegacySessionForSignOut:(NSURL *) url
-         withPresentingViewController:(UIViewController *) presentingViewController {
-    if (self.useSFAuthenticationSession) {
-        if (@available(iOS 11.0, *)) {
-            [self launchSFAuthenticationSessionForSignOut:url];
-        } else {
-            [self signOutSFSafariVC:presentingViewController url:url];
-        }
-    } else {
-        [self signOutSFSafariVC:presentingViewController url:url];
-    }
-}
-
-- (void)launchSFAuthenticationSessionForSignOut:(NSURL *) url API_AVAILABLE(ios(11.0)) {
-    self.sfAuthenticationSessionAvailable = YES;
-    NSString *callbackURLScheme = [[self urlEncode:self.authConfiguration.signOutRedirectUri] copy];
-    __weak AWSCognitoAuth *weakSelf = self;
-    self.sfAuthSession = [[SFAuthenticationSession alloc] initWithURL:url
-                                                    callbackURLScheme:callbackURLScheme
-                                                    completionHandler:^(NSURL * _Nullable url,
-                                                                        NSError * _Nullable error) {
-        __strong AWSCognitoAuth *strongSelf = weakSelf;
-        if (url) {
-            [strongSelf processURL:url forRedirection:NO];
-        } else {
-            if (error.code != SFAuthenticationErrorCanceledLogin) {
-                [strongSelf signOutLocallyAndClearLastKnownUser];
-            }
-            [strongSelf dismissSafariViewControllerAndCompleteSignOut:error];
-        }
-    }];
-    [self.sfAuthSession start];
-}
-
-- (void)signOutSFSafariVC: (UIViewController *) vc
-                      url:(NSURL *)url {
-    self.svc = [[SFSafariViewController alloc] initWithURL:url entersReaderIfAvailable:NO];
-    self.svc.delegate = self;
-    self.svc.modalPresentationStyle = UIModalPresentationPopover;
+- (void)signOutWithUrl:(NSString *)url {
     self.isProcessingSignOut = YES;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self setPopoverSource:self.svc source:vc];
-        [vc presentViewController:self.svc animated:NO completion:nil];
+        WKWebViewConfiguration *wkConfiguration = [WKWebViewConfiguration new];
+        self.headlessWebView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:wkConfiguration];
+        self.headlessWebView.navigationDelegate = self;
+        NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:url]];
+        [self.headlessWebView loadRequest:request];
     });
 }
 
@@ -704,6 +502,7 @@ withPresentingViewController:(UIViewController *)presentingViewController {
 -(void) signOutLocallyAndClearLastKnownUser{
     [self signOutLocally];
     [self clearLastKnownUser];
+    self.headlessWebView = nil;
 }
 
 #pragma mark date conversion
@@ -739,21 +538,6 @@ withPresentingViewController:(UIViewController *)presentingViewController {
 }
 
 
-
-#pragma mark SFSafariViewController delegate
-
-/*! @abstract Delegate callback called when the user taps the Done button. Upon this call, the view controller is dismissed modally. */
-- (void)safariViewControllerDidFinish:(SFSafariViewController *)controller {
-    NSError *error = [self getError:@"User cancelled operation" code:AWSCognitoAuthClientErrorUserCanceledOperation];
-    if(self.getSessionBlock){
-        [self setInternalGetSessionErrorAndCancelSignInOperations:error];
-        [self cleanUpAndCallGetSessionBlock:nil error:error];
-    } else {
-        [self setInternalSignOutErrorAndCancelSignOutOperations:error];
-        [self cleanUpAndCallSignOutBlock:error];
-    }
-}
-
 - (void)setInternalSignOutErrorAndCancelSignOutOperations:(NSError *)error {
     self.signOutError = error;
     [self.signOutQueue cancelAllOperations];
@@ -762,22 +546,6 @@ withPresentingViewController:(UIViewController *)presentingViewController {
 - (void)setInternalGetSessionErrorAndCancelSignInOperations:(NSError *)error {
     self.getSessionError = error;
     [self.getSessionQueue cancelAllOperations];
-}
-
-/*! @abstract Invoked when the initial URL load is complete.
- @param didLoadSuccessfully YES if loading completed successfully, NO if loading failed.
- @discussion This method is invoked when SFSafariViewController completes the loading of the URL that you pass
- to its initializer. It is not invoked for any subsequent page loads in the same SFSafariViewController instance.
- */
-- (void)safariViewController:(SFSafariViewController *)controller didCompleteInitialLoad:(BOOL)didLoadSuccessfully {
-    if(!didLoadSuccessfully && !self.isHandlingRedirection && !(self.isProcessingSignOut || self.isProcessingSignIn)){
-        NSError *error = [self getError:@"Loading page failed" code:AWSCognitoAuthClientErrorLoadingPageFailed];
-        if(self.getSessionBlock){
-            [self dismissSafariViewControllerAndCompleteGetSession:nil error:error];
-        }else if(self.signOutBlock){
-            [self dismissSafariViewControllerAndCompleteSignOut:error];
-        }
-    }
 }
 
 #pragma PKCE
@@ -832,7 +600,7 @@ withPresentingViewController:(UIViewController *)presentingViewController {
     NSMutableDictionary *queryItemsDict = nil;
     if(queryItems) {
         queryItemsDict = [NSMutableDictionary new];
-
+        
         for(NSURLQueryItem * queryItem in queryItems){
             [queryItemsDict setObject:queryItem.value forKey:queryItem.name];
         }
@@ -844,16 +612,12 @@ withPresentingViewController:(UIViewController *)presentingViewController {
         if(queryItemsDict[@"code"]){
             //if state doesn't match, abort
             if(![self.state isEqualToString:queryItemsDict[@"state"]]){
-                [self dismissSafariViewControllerAndCompleteGetSession:nil error:[self getError:@"State code did not match request" code: AWSCognitoAuthClientErrorSecurityFailed]];
+                [self completeGetSession:nil error:[self getError:@"State code did not match request" code: AWSCognitoAuthClientErrorSecurityFailed]];
                 return YES;
             } else {
                 //continue with authorization code request
                 NSString * code = queryItemsDict[@"code"];
                 if(code){
-                    // If we are processing this request on behalf of a redirection request from SFSafariViewController, then
-                    // set a flag to prevent us from interpreting a "NO" callback to `safariViewController:didCompleteInitialLoad:`
-                    // as an error. We will clear this flag in `connectionDidFinishLoading:` after the auth token request has
-                    // completed
                     if (isProcessingRedirection) {
                         self.isHandlingRedirection = YES;
                     }
@@ -882,7 +646,7 @@ withPresentingViewController:(UIViewController *)presentingViewController {
             if(errorDescription){
                 error = [NSString stringWithFormat:@"%@: %@", error, errorDescription];
             }
-            [self dismissSafariViewControllerAndCompleteGetSession:nil error:[self getError:error code: AWSCognitoAuthClientErrorBadRequest]];
+            [self completeGetSession:nil error:[self getError:error code: AWSCognitoAuthClientErrorBadRequest]];
             return YES;
         }
     } else if([urlLowerCaseString hasPrefix:signOutRedirectLowerCaseString]){
@@ -893,10 +657,10 @@ withPresentingViewController:(UIViewController *)presentingViewController {
                 error = [NSString stringWithFormat:@"%@: %@", error, errorDescription];
             }
             [self signOutLocallyAndClearLastKnownUser];
-            [self dismissSafariViewControllerAndCompleteSignOut:[self getError:error code:AWSCognitoAuthClientErrorBadRequest]];
+            [self completeSignOut:[self getError:error code:AWSCognitoAuthClientErrorBadRequest]];
         }else{
             [self signOutLocallyAndClearLastKnownUser];
-            [self dismissSafariViewControllerAndCompleteSignOut:nil];
+            [self completeSignOut:nil];
         }
         return YES;
     }
@@ -917,23 +681,6 @@ withPresentingViewController:(UIViewController *)presentingViewController {
     [request setValue: [self fetchBaseUserAgent] forHTTPHeaderField:@"User-Agent"];
 }
 
-/**
- Dismiss and reap the safari view controller
- */
--(void) dismissSafariVC: (void (^)(void)) dismissBlock {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if(self.svc){
-            [self.svc dismissViewControllerAnimated:NO completion:^{
-                dismissBlock();
-                //clean up vc
-                self.svc = nil;
-            }];
-        } else {
-            dismissBlock();
-        }
-    });
-}
-
 #pragma mark NSURLConnection Delegate Methods
 
 - (void)connection:(NSURLConnection *)connection didReceiveResponse:(NSURLResponse *)response {
@@ -949,24 +696,15 @@ withPresentingViewController:(UIViewController *)presentingViewController {
     NSError * error;
     NSDictionary *result = [NSJSONSerialization JSONObjectWithData:self.responseData options:kNilOptions error:&error];
     if(error){
-        [self dismissSafariViewControllerAndCompleteGetSession:nil error:[self getError:[error description] code:AWSCognitoAuthClientErrorUnknown]];
+        [self completeGetSession:nil error:[self getError:[error description] code:AWSCognitoAuthClientErrorUnknown]];
         return;
     }
     else if(result[@"error"]){
         //refresh token has expired, switch to interactive auth
         if([@"invalid_grant" isEqualToString:result[@"error"]]){
-            if (![self.delegate respondsToSelector:@selector(shouldLaunchSignInVCIfRefreshTokenIsExpired)]) {
-                [self launchSignInVC:self.pvc];
-            }else {
-                BOOL present = [self.delegate shouldLaunchSignInVCIfRefreshTokenIsExpired];
-                if (present) {
-                    [self launchSignInVC:self.pvc];
-                }else {
-                    [self dismissSafariViewControllerAndCompleteGetSession:nil error:[self getError:result[@"error"] code:AWSCognitoAuthClientErrorExpiredRefreshToken]];
-                }
-            }
+            [self launchSignIn];
         }else {
-            [self dismissSafariViewControllerAndCompleteGetSession:nil error:[self getError:result[@"error"] code:AWSCognitoAuthClientErrorUnknown]];
+            [self completeGetSession:nil error:[self getError:result[@"error"] code:AWSCognitoAuthClientErrorUnknown]];
         }
     }else {
         /** Check to see if refreshToken is received from the server.
@@ -979,16 +717,16 @@ withPresentingViewController:(UIViewController *)presentingViewController {
         }
         AWSCognitoAuthUserSession *userSession = [[AWSCognitoAuthUserSession alloc] initWithIdToken:[result valueForKey:@"id_token"]  accessToken:[result valueForKey:@"access_token"] refreshToken:refreshToken expiresIn:[result valueForKey:@"expires_in"]];
         if(!userSession.accessToken){
-            [self dismissSafariViewControllerAndCompleteGetSession:nil error: [self getError:@"Tokens not received" code:AWSCognitoAuthClientErrorUnknown]];
+            [self completeGetSession:nil error: [self getError:@"Tokens not received" code:AWSCognitoAuthClientErrorUnknown]];
         }else{
             [self updateUsernameAndPersistTokens:userSession];
-            [self dismissSafariViewControllerAndCompleteGetSession:userSession error:nil];
+            [self completeGetSession:userSession error:nil];
         }
     }
 }
 
 - (void)connection:(NSURLConnection *)connection didFailWithError:(NSError *)error {
-    [self dismissSafariViewControllerAndCompleteGetSession:nil error:[self getError:error.description code:AWSCognitoAuthClientErrorLoadingPageFailed]];
+    [self completeGetSession:nil error:[self getError:error.description code:AWSCognitoAuthClientErrorLoadingPageFailed]];
 }
 
 
@@ -1214,8 +952,6 @@ withPresentingViewController:(UIViewController *)presentingViewController {
     NSArray *pieces = [self.tokenString componentsSeparatedByString:@"."];
     if(pieces.count > 2){
         NSString * claims = pieces[1];
-        claims = [claims stringByReplacingOccurrencesOfString:@"-" withString:@"+"];
-        claims = [claims stringByReplacingOccurrencesOfString:@"_" withString:@"/"];
         //JWT is not padded with =, pad it if necessary
         NSUInteger paddedLength = claims.length + (4 - (claims.length % 4)) % 4;;
         claims = [claims stringByPaddingToLength:paddedLength withString:@"=" startingAtIndex:0];
@@ -1257,27 +993,6 @@ withPresentingViewController:(UIViewController *)presentingViewController {
 }
 
 - (instancetype)initWithAppClientId:(NSString *) appClientId
-                    appClientSecret:(nullable NSString *) appClientSecret
-                             scopes:(NSSet<NSString *> *) scopes
-                  signInRedirectUri:(NSString *) signInRedirectUri
-                 signOutRedirectUri:(NSString *) signOutRedirectUri
-                          webDomain:(NSString *) webDomain
-                   identityProvider:(nullable NSString *) identityProvider
-                      idpIdentifier:(nullable NSString *) idpIdentifier
-           userPoolIdForEnablingASF:(nullable NSString *) userPoolIdForEnablingASF {
-    return [self initWithAppClientId:appClientId
-                     appClientSecret:appClientSecret
-                              scopes:scopes
-                   signInRedirectUri:signInRedirectUri
-                  signOutRedirectUri:signOutRedirectUri
-                           webDomain:webDomain
-                    identityProvider:identityProvider
-                       idpIdentifier:idpIdentifier
-            userPoolIdForEnablingASF:userPoolIdForEnablingASF
-      enableSFAuthSessionIfAvailable:NO];
-}
-
-- (instancetype)initWithAppClientId:(NSString *) appClientId
                     appClientSecret:(nullable NSString *)appClientSecret
                              scopes:(NSSet<NSString *> *) scopes
                   signInRedirectUri:(NSString *) signInRedirectUri
@@ -1285,8 +1000,7 @@ withPresentingViewController:(UIViewController *)presentingViewController {
                           webDomain:(NSString *) webDomain
                    identityProvider:(nullable NSString *) identityProvider
                       idpIdentifier:(nullable NSString *) idpIdentifier
-           userPoolIdForEnablingASF:(nullable NSString *) userPoolIdForEnablingASF
-     enableSFAuthSessionIfAvailable:(BOOL) enableSFAuthSession  {
+           userPoolIdForEnablingASF:(nullable NSString *) userPoolIdForEnablingASF {
     
     
     return [self initWithAppClientIdInternal:appClientId
@@ -1298,7 +1012,6 @@ withPresentingViewController:(UIViewController *)presentingViewController {
                             identityProvider:identityProvider
                                idpIdentifier:idpIdentifier
                     userPoolIdForEnablingASF:userPoolIdForEnablingASF
-              enableSFAuthSessionIfAvailable:enableSFAuthSession
                                    signInUri:[NSString stringWithFormat:@"%@/oauth2/authorize",webDomain]
                                   signOutUri:[NSString stringWithFormat:@"%@/logout",webDomain]
                                    tokensUri:[NSString stringWithFormat:@"%@/oauth2/token",webDomain]
@@ -1317,7 +1030,6 @@ withPresentingViewController:(UIViewController *)presentingViewController {
                            identityProvider:(nullable NSString *) identityProvider
                               idpIdentifier:(nullable NSString *) idpIdentifier
                    userPoolIdForEnablingASF:(nullable NSString *) userPoolIdForEnablingASF
-             enableSFAuthSessionIfAvailable:(BOOL) enableSFAuthSession
                                   signInUri:(NSString *) signInUri
                                  signOutUri:(NSString *) signOutUri
                                   tokensUri:(NSString *) tokensUri
@@ -1335,7 +1047,6 @@ withPresentingViewController:(UIViewController *)presentingViewController {
                             identityProvider:identityProvider
                                idpIdentifier:idpIdentifier
                     userPoolIdForEnablingASF:userPoolIdForEnablingASF
-              enableSFAuthSessionIfAvailable:enableSFAuthSession
                                    signInUri:signInUri
                                   signOutUri:signOutUri
                                    tokensUri:tokensUri
@@ -1343,8 +1054,7 @@ withPresentingViewController:(UIViewController *)presentingViewController {
                    signOutUriQueryParameters:signOutUriQueryParameters
                      tokenUriQueryParameters:tokenUriQueryParameters
                           isProviderExternal:isProviderExternal
-                cognitoUserPoolServiceConfig:nil
-                        signInPrivateSession:NO];
+                cognitoUserPoolServiceConfig: nil];
 }
 
 - (instancetype)initWithAppClientIdInternal:(NSString *) appClientId
@@ -1356,7 +1066,6 @@ withPresentingViewController:(UIViewController *)presentingViewController {
                            identityProvider:(nullable NSString *) identityProvider
                               idpIdentifier:(nullable NSString *) idpIdentifier
                    userPoolIdForEnablingASF:(nullable NSString *) userPoolIdForEnablingASF
-             enableSFAuthSessionIfAvailable:(BOOL) enableSFAuthSession
                                   signInUri:(NSString *) signInUri
                                  signOutUri:(NSString *) signOutUri
                                   tokensUri:(NSString *) tokensUri
@@ -1364,8 +1073,7 @@ withPresentingViewController:(UIViewController *)presentingViewController {
                   signOutUriQueryParameters:(NSDictionary<NSString *, NSString *> *) signOutUriQueryParameters
                     tokenUriQueryParameters:(NSDictionary<NSString *, NSString *> *) tokenUriQueryParameters
                          isProviderExternal:(BOOL) isProviderExternal
-               cognitoUserPoolServiceConfig:(nullable AWSServiceConfiguration *) serviceConfig
-                       signInPrivateSession:(BOOL)isSignInPrivateSession {
+               cognitoUserPoolServiceConfig:(nullable AWSServiceConfiguration *) serviceConfig {
     if (self = [super init]) {
         
         if (!isProviderExternal) {
@@ -1389,12 +1097,10 @@ withPresentingViewController:(UIViewController *)presentingViewController {
         _identityProvider = identityProvider;
         _idpIdentifier = idpIdentifier;
         _userPoolId = userPoolIdForEnablingASF;
-        _isSFAuthenticationSessionEnabled = enableSFAuthSession;
         _signInUriQueryParameters = signInUriQueryParameters;
         _tokensUriQueryParameters = tokenUriQueryParameters;
         _isAuthProviderExternal = isProviderExternal;
         _userPoolConfig = serviceConfig;
-        _isSignInPrivateSession = isSignInPrivateSession;
     }
     
     return self;
@@ -1412,16 +1118,13 @@ withPresentingViewController:(UIViewController *)presentingViewController {
                                                                                                identityProvider:self.identityProvider
                                                                                                   idpIdentifier:self.idpIdentifier
                                                                                        userPoolIdForEnablingASF:self.userPoolId
-                                                                                 enableSFAuthSessionIfAvailable: self.isSFAuthenticationSessionEnabled
                                                                                                       signInUri: self.signInUri
                                                                                                      signOutUri:self.signOutUri
                                                                                                       tokensUri:self.tokensUri
                                                                                        signInUriQueryParameters:self.signInUriQueryParameters
                                                                                       signOutUriQueryParameters:self.signOutUriQueryParameters
                                                                                         tokenUriQueryParameters:self.tokensUriQueryParameters
-                                                                                             isProviderExternal:self.isAuthProviderExternal
-                                                                                   cognitoUserPoolServiceConfig:self.userPoolConfig
-                                                                                           signInPrivateSession:self.isSignInPrivateSession];
+                                                                                             isProviderExternal:self.isAuthProviderExternal];
     return configuration;
 }
 
